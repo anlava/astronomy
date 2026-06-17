@@ -1,62 +1,36 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Distribution / packaging
+*.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+dist/
+build/
 
-# Virtual environments
-venv/
-ENV/
-env/
-.venv/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Jupyter Notebook
+# Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
-# pytest
-.pytest_cache/
-
-# mypy
-.mypy_cache/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# training artifacts
-*.log*
-checkpoints/
+# Generated outputs
+active_learning_output*/
 catboost_info/
-lightning_logs/
-logs/
-
-# Data
 data/
 *.parquet
+*.joblib
+*.png
+*.bmp
+*.jpg
+*.jpeg
+*.gif
+*.zip
+*.log
 
+# Sensitive / personal
+expert_labels.txt
+.flare_labeller_state.json
 
-tmpclaude*
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
