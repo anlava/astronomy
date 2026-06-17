@@ -34,9 +34,8 @@ See `deploy/README.md` for full instructions. Quick summary:
 1. Create Yandex Cloud VM: 16 vCPU, 128 GB RAM, 500 GB SSD, Ubuntu 22.04
 2. Run `deploy/setup_vm.sh` on the VM to install Python 3.11 and dependencies
 3. Configure HuggingFace access (VPN/proxy/`HF_ENDPOINT`) because Russian IPs may get 403
-4. Download data: `python deploy/download_dataset.py --split target`
-5. Extract features: `screen -S features ./deploy/run_compute_features.sh`
-6. Run active learning: `screen -S al ./deploy/run_active_learning.sh`
+4. Extract features: `screen -S features ./deploy/run_compute_features.sh` (данные скачиваются автоматически)
+5. Run active learning: `screen -S al ./deploy/run_active_learning.sh`
 
 ## Known constraints
 

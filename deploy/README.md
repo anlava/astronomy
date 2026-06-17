@@ -77,7 +77,7 @@ git remote set-url fork git@github.com:anlava/astronomy.git
 
 ## 4. Доступ к HuggingFace из РФ
 
-CDN HuggingFace (`cas-bridge.xethub.hf.co`, CloudFront) может отдавать 403 для российских IP. Варианты решения:
+`compute_all_features.py` скачивает данные через `datasets.load_dataset`. CDN HuggingFace (`cas-bridge.xethub.hf.co`, CloudFront) может отдавать 403 для российских IP. Варианты решения:
 
 ### 4.1. VPN / прокси на стороне VM
 
@@ -95,62 +95,26 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 > **Примечание**: работоспособность зеркала из РФ не гарантируется, проверяйте `curl $HF_ENDPOINT`.
 
-### 4.3. Ручная загрузка датасета
+### 4.3. Проверка перед длительным прогоном
 
-Если автоматическая загрузка невозможна, скачайте `snad-space/ztf-m-dwarf-flares-2025` локально и загрузите на VM через `rsync` / `scp` в `~/astronomy/data`.
-
-## 5. Скачивание датасета с HuggingFace
-
-Перед запуском `compute_all_features.py` полезно отдельно скачать датасет, чтобы не ловить 403 посреди вычислений.
-
-### 5.1. Проверка доступа
-
-```bash
-cd ~/astronomy
-./deploy/test_hf_access.sh
-```
-
-Скрипт проверяет доступность `huggingface.co` и `hf-mirror.com`, а затем пытается загрузить первые 1000 строк сплита `train`.
-
-### 5.2. Скачивание через datasets (рекомендуется)
+Перед запуском `compute_all_features.py` на `target` убедитесь, что `datasets.load_dataset` не падает с 403:
 
 ```bash
 cd ~/astronomy
 source .venv/bin/activate
-
-# Скачать target (~30 GB сырых данных, 314 parquet-файлов)
-python deploy/download_dataset.py --split target --num-proc 4
-
-# Или train (~0.8 GB) для быстрой проверки
-python deploy/download_dataset.py --split train --num-proc 4
+python - <<'PY'
+from datasets import load_dataset
+try:
+    ds = load_dataset("snad-space/ztf-m-dwarf-flares-2025", split="train[:1000]", trust_remote_code=True)
+    print("OK", len(ds))
+except Exception as e:
+    print("ERROR", e)
+PY
 ```
 
-Датасет кэшируется в `~/.cache/huggingface`. Убедитесь, что на диске достаточно места (target требует ~50–70 GB под кэш + parquet).
+### 4.4. Ручная загрузка датасета
 
-### 5.3. Если HuggingFace недоступен из РФ
-
-Установите одну из переменных окружения перед скачиванием:
-
-```bash
-# Вариант A: зеркало (проверьте работоспособность)
-export HF_ENDPOINT=https://hf-mirror.com
-
-# Вариант B: HTTP-прокси
-export HTTPS_PROXY=http://<proxy-host>:<port>
-export HF_HUB_ENABLE_HF_TRANSFER=1
-
-# Вариант C: VPN на уровне системы/сетевого интерфейса VM
-```
-
-Проверка зеркала:
-
-```bash
-curl -I $HF_ENDPOINT/datasets/snad-space/ztf-m-dwarf-flares-2025
-```
-
-### 5.4. Ручная загрузка
-
-Если автоматическое скачивание невозможно:
+Если автоматическая загрузка невозможна:
 
 1. Скачайте датасет локально (с VPN):
    ```bash
@@ -162,7 +126,7 @@ curl -I $HF_ENDPOINT/datasets/snad-space/ztf-m-dwarf-flares-2025
    ```
 3. При запуске `compute_all_features.py` HF-кэш должен указывать на эту директорию.
 
-## 6. Извлечение признаков для `target`
+## 5. Извлечение признаков для `target`
 
 ```bash
 cd ~/astronomy
@@ -170,11 +134,11 @@ screen -S features
 ./deploy/run_compute_features.sh
 ```
 
-Процесс занимает **3–8 часов** и создаёт `~/astronomy/data/all_features.parquet` (~80–90 GB для 201 колонки).
+Процесс занимает **3–8 часов** и создаёт `~/astronomy/data/all_features.parquet` (~80–90 GB для 201 колонки). Данные скачиваются автоматически через `datasets.load_dataset` и кэшируются в `~/.cache/huggingface`.
 
 Отключитесь от screen: `Ctrl+A, D`. Вернуться: `screen -r features`.
 
-## 7. Запуск active learning пайплайна
+## 6. Запуск active learning пайплайна
 
 ```bash
 cd ~/astronomy
@@ -188,7 +152,7 @@ screen -S al
 - запускает CatBoost в CPU-режиме;
 - пишет результаты в `~/astronomy/active_learning_output_target/`.
 
-## 8. Мониторинг
+## 7. Мониторинг
 
 ```bash
 # Загрузка CPU/RAM/disk
@@ -199,7 +163,7 @@ nvme smart-log /dev/vda   # или df -h
 tail -f ~/astronomy/active_learning_output_target/pipeline.log
 ```
 
-## 9. После завершения
+## 8. После завершения
 
 Результаты:
 - `~/astronomy/data/all_features.parquet` — признаки для target
