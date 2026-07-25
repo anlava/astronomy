@@ -25,7 +25,35 @@ Key splits:
 - `compute_all_features.py --split target` — extract features, writes `data/all_features.parquet`
 - `run_pipeline_target.py` — active learning on `target`
 - `run_pipeline.py` — active learning on `train` (smoke test)
+- `run_pipeline_custom.py` — active learning on custom light curves (see below)
 - `check_indices.py` — verify `surely_pos`/`surely_neg` overlap with a parquet file
+
+## Custom light curves (non-HF data)
+
+`extract_features_from_polars(df)` in `astro_flares.py` computes the exact same
+~478 features as `extract_all_features` but for any polars DataFrame with
+list columns `id, mag, magerr, mjd` (one row per light curve). Keep default
+parameters to stay feature-compatible with models trained on the HF dataset.
+
+`run_pipeline_custom.py` is the reference runner for custom data (e.g. ~15k
+cluster light curves):
+
+```bash
+python run_pipeline_custom.py --input my_curves.parquet \
+    --known-flare-indices my_flares.txt \
+    --known-negative-indices my_negatives.txt
+```
+
+Key facts:
+- Input parquet: one row per curve, columns `id`, `mag`, `magerr`, `mjd` (lists)
+- Known flares from `target` (`surely_pos`) are mixed in as transfer learning
+  by default (disable with `--no-target-labels`)
+- `surely_neg` / `expert_labels.txt` are **positional indices into target** and
+  are NOT valid for custom data; the script redirects expert labels to
+  `<output-dir>/expert_labels_custom.txt` and translates user-supplied index
+  files into unlabeled-pool positions
+- Negative splits (`n_train_neg_init`, `n_validation_neg`) auto-scale when the
+  unlabeled pool is smaller than the target-oriented defaults (110k)
 
 ## Deployment
 

@@ -3388,6 +3388,192 @@ def rank_discriminative_features(
     return result_df
 
 
+def extract_features_from_polars(
+    df: pl.DataFrame,
+    normalize: str | None = None,
+    float32: bool = True,
+    engine: str = DEFAULT_ENGINE,
+    wavelets: list[str] | None = None,
+    max_level: int = 5,
+    interpolate: bool = True,
+    n_interp_points: int = 64,
+    argextremum_stats_col: str | None = "mag",
+    argextremum_compute_additional_stats: bool = True,
+    argextremum_compute_argmin_stats: bool = True,
+    argextremum_compute_argmax_stats: bool = False,
+    od_col: str = "mag",
+    od_iqr: float = 40.0,
+) -> pl.DataFrame:
+    """Extract ALL features from an arbitrary polars DataFrame of light curves.
+
+    This is the standalone (non-HuggingFace) version of the in-memory branch of
+    ``extract_all_features``. Use it to compute the exact same feature set for
+    custom light curves (e.g. a different ZTF subset) so that models trained on
+    the HuggingFace dataset can be applied/transferred directly.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        One row per light curve. Expected columns (all optional except the
+        ones needed for the desired features):
+        - ``id`` : unique object identifier (passed through to output)
+        - ``class`` : optional int label (passed through to output)
+        - ``mag``, ``magerr``, ``mjd`` : ``List(Float)`` columns with the
+          photometric time series (variable length per row).
+    normalize, float32, engine, wavelets, max_level, interpolate,
+    n_interp_points, argextremum_stats_col, argextremum_compute_additional_stats,
+    argextremum_compute_argmin_stats, argextremum_compute_argmax_stats,
+    od_col, od_iqr
+        Same meaning as in ``extract_all_features``. Keep the defaults to stay
+        feature-compatible with models trained on
+        ``snad-space/ztf-m-dwarf-flares-2025``.
+
+    Returns
+    -------
+    pl.DataFrame
+        DataFrame with all features (main + additional + fraction +
+        argextremum + wavelet), one row per input light curve.
+    """
+    if wavelets is None:
+        wavelets = DEFAULT_WAVELETS
+
+    dataset_len = len(df)
+    logger.info(f"[features_from_polars] Computing features for {dataset_len} light curves, wavelets={wavelets}")
+
+    has_mag = "mag" in df.columns
+    has_magerr = "magerr" in df.columns
+    has_mjd = "mjd" in df.columns
+    has_norm = has_mag and has_magerr
+    has_velocity = has_mag and has_mjd
+
+    # Keep raw series for the wavelet pass (it must see un-cleaned data,
+    # mirroring extract_all_features which reads the original dataset rows).
+    raw_mag = df["mag"].to_list() if has_mag else None
+    raw_magerr = df["magerr"].to_list() if has_magerr else None
+    raw_mjd = df["mjd"].to_list() if has_mjd else None
+
+    # Outlier detection/cleaning (before norm and velocity computation)
+    if od_iqr and od_iqr > 0 and od_col in df.columns:
+        df = _clean_single_outlier_native(df, od_col=od_col, od_iqr=od_iqr)
+        # had_od column is now present
+
+    if has_norm:
+        df = df.with_columns(_norm_expr(float32))
+
+    # Compute velocity = mag.diff() / mjd.diff() (rate of magnitude change)
+    if has_velocity:
+        velocity_expr = pl.col("mag").list.eval(pl.element().diff().drop_nulls()) / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
+        if float32:
+            velocity_expr = velocity_expr.list.eval(pl.element().cast(pl.Float32))
+        df = df.with_columns(velocity_expr.alias("velocity"))
+
+    main_parts: list[pl.DataFrame] = []
+    meta_cols = [c for c in ["id", "class", "had_od"] if c in df.columns]
+    if meta_cols:
+        main_parts.append(df.select(meta_cols))
+
+    if has_mag:
+        main_parts.append(extract_features_polars(df.select("mag"), normalize=normalize, float32=float32, engine=engine))
+    if has_magerr:
+        magerr_f = extract_features_polars(df.select("magerr"), normalize=normalize, float32=float32, engine=engine)
+        if "npoints" in magerr_f.columns and any("npoints" in p.columns for p in main_parts):
+            magerr_f = magerr_f.drop("npoints")
+        main_parts.append(magerr_f)
+    if has_norm:
+        norm_f = extract_features_polars(df.select("norm"), normalize=normalize, float32=float32, engine=engine)
+        if "npoints" in norm_f.columns and any("npoints" in p.columns for p in main_parts):
+            norm_f = norm_f.drop("npoints")
+        main_parts.append(norm_f)
+    if has_velocity:
+        velocity_f = extract_features_polars(df.select("velocity"), normalize=normalize, float32=float32, engine=engine)
+        if "npoints" in velocity_f.columns and any("npoints" in p.columns for p in main_parts):
+            velocity_f = velocity_f.drop("npoints")
+        main_parts.append(velocity_f)
+    if has_mjd:
+        df_mjd = df.select("mjd")
+        if float32:
+            df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
+        mjd_f = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
+        if "npoints" in mjd_f.columns and any("npoints" in p.columns for p in main_parts):
+            mjd_f = mjd_f.drop("npoints")
+        main_parts.append(mjd_f)
+        ts_col = (
+            df.select(pl.col("mjd").list.max().alias("mjd_max"))
+            .with_columns((pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts"))
+            .select("ts")
+        )
+        main_parts.append(ts_col)
+
+    main_features = pl.concat(main_parts, how="horizontal")
+
+    # Additional features for mag, norm, velocity
+    additional_parts: list[pl.DataFrame] = []
+
+    if has_mag:
+        mag_add_exprs = _get_additional_feature_exprs("mag", include_mjd_features=False)
+        mag_add = df.select(["mag"]).lazy().select(mag_add_exprs).collect(engine=engine)
+        additional_parts.append(mag_add)
+
+    if has_norm and has_mjd:
+        norm_add_exprs = _get_additional_feature_exprs("norm", include_mjd_features=True)
+        norm_add = df.select(["norm", "mjd"]).lazy().select(norm_add_exprs).collect(engine=engine)
+        additional_parts.append(norm_add)
+
+    if has_velocity:
+        vel_add_exprs = _get_additional_feature_exprs("velocity", prefix="vel", include_mjd_features=False)
+        vel_add = df.select(["velocity"]).lazy().select(vel_add_exprs).collect(engine=engine)
+        additional_parts.append(vel_add)
+
+    additional_features = pl.concat(additional_parts, how="horizontal") if additional_parts else pl.DataFrame()
+    if float32 and len(additional_features) > 0:
+        additional_features = additional_features.cast({c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64})
+
+    # Argextremum stats (sub-series split by argmax/argmin)
+    argextremum_features = pl.DataFrame()
+    if argextremum_stats_col and argextremum_stats_col in df.columns:
+        stats_cols = [c for c in ["mag", "norm", "velocity"] if c in df.columns]
+        argext_exprs = _get_argextremum_stats_exprs(
+            index_col=argextremum_stats_col,
+            stats_cols=stats_cols,
+            compute_additional=argextremum_compute_additional_stats,
+            compute_argmin_stats=argextremum_compute_argmin_stats,
+            compute_argmax_stats=argextremum_compute_argmax_stats,
+        )
+        if argext_exprs:  # Only compute if there are expressions
+            df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
+            argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
+            if float32 and len(argextremum_features) > 0:
+                argextremum_features = argextremum_features.cast(
+                    {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
+                )
+
+    parts_to_combine = [main_features, additional_features]
+    if len(argextremum_features) > 0:
+        parts_to_combine.append(argextremum_features)
+    combined = pl.concat(parts_to_combine, how="horizontal")
+    fractions = compute_fraction_features(combined)
+    combined = pl.concat([combined, fractions], how="horizontal")
+
+    # Wavelet features (batch processing with pre-allocated array)
+    feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix="norm")
+    n_features = len(feature_names)
+    all_wavelet_features = np.zeros((dataset_len, n_features), dtype=np.float64)
+
+    for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
+        mjd_arr = np.asarray(raw_mjd[i], dtype=np.float64)
+        mag_arr = np.asarray(raw_mag[i], dtype=np.float64)
+        magerr_arr = np.asarray(raw_magerr[i], dtype=np.float64)
+        norm = _safe_normalize(mag_arr, magerr_arr)
+        all_wavelet_features[i] = _compute_wavelet_features_array(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
+
+    wavelet_df = pl.DataFrame(all_wavelet_features, schema=feature_names)
+    if float32:
+        wavelet_df = wavelet_df.cast({c: pl.Float32 for c in wavelet_df.columns if wavelet_df[c].dtype == pl.Float64})
+
+    result = pl.concat([combined, wavelet_df], how="horizontal")
+    return result
+
+
 def extract_all_features(
     dataset_name: str,
     split: str,
@@ -3545,133 +3731,22 @@ def extract_all_features(
         cols_to_load = ["id", "class", "mag", "magerr", "mjd"]
         df = dataset.select_columns([c for c in cols_to_load if c in dataset.column_names]).to_polars()
 
-        has_mag = "mag" in df.columns
-        has_magerr = "magerr" in df.columns
-        has_mjd = "mjd" in df.columns
-        has_norm = has_mag and has_magerr
-        has_velocity = has_mag and has_mjd
-
-        # Outlier detection/cleaning (before norm and velocity computation)
-        if od_iqr and od_iqr > 0 and od_col in df.columns:
-            df = _clean_single_outlier_native(df, od_col=od_col, od_iqr=od_iqr)
-            # had_od column is now present
-
-        if has_norm:
-            df = df.with_columns(_norm_expr(float32))
-
-        # Compute velocity = mag.diff() / mjd.diff() (rate of magnitude change)
-        if has_velocity:
-            velocity_expr = pl.col("mag").list.eval(pl.element().diff().drop_nulls()) / pl.col("mjd").list.eval(pl.element().diff().drop_nulls())
-            if float32:
-                velocity_expr = velocity_expr.list.eval(pl.element().cast(pl.Float32))
-            df = df.with_columns(velocity_expr.alias("velocity"))
-
-        main_parts: list[pl.DataFrame] = []
-        meta_cols = [c for c in ["id", "class", "had_od"] if c in df.columns]
-        if meta_cols:
-            main_parts.append(df.select(meta_cols))
-
-        if has_mag:
-            main_parts.append(extract_features_polars(df.select("mag"), normalize=normalize, float32=float32, engine=engine))
-        if has_magerr:
-            magerr_f = extract_features_polars(df.select("magerr"), normalize=normalize, float32=float32, engine=engine)
-            if "npoints" in magerr_f.columns and any("npoints" in p.columns for p in main_parts):
-                magerr_f = magerr_f.drop("npoints")
-            main_parts.append(magerr_f)
-        if has_norm:
-            norm_f = extract_features_polars(df.select("norm"), normalize=normalize, float32=float32, engine=engine)
-            if "npoints" in norm_f.columns and any("npoints" in p.columns for p in main_parts):
-                norm_f = norm_f.drop("npoints")
-            main_parts.append(norm_f)
-        if has_velocity:
-            velocity_f = extract_features_polars(df.select("velocity"), normalize=normalize, float32=float32, engine=engine)
-            if "npoints" in velocity_f.columns and any("npoints" in p.columns for p in main_parts):
-                velocity_f = velocity_f.drop("npoints")
-            main_parts.append(velocity_f)
-        if has_mjd:
-            df_mjd = df.select("mjd")
-            if float32:
-                df_mjd = df_mjd.with_columns(pl.col("mjd").list.eval(pl.element().cast(pl.Float32)))
-            mjd_f = extract_features_polars(df_mjd, normalize=normalize, float32=float32, engine=engine)
-            if "npoints" in mjd_f.columns and any("npoints" in p.columns for p in main_parts):
-                mjd_f = mjd_f.drop("npoints")
-            main_parts.append(mjd_f)
-            ts_col = (
-                df.select(pl.col("mjd").list.max().alias("mjd_max"))
-                .with_columns((pl.lit(MJD_EPOCH) + pl.duration(days=pl.col("mjd_max"))).alias("ts"))
-                .select("ts")
-            )
-            main_parts.append(ts_col)
-
-        main_features = pl.concat(main_parts, how="horizontal")
-
-        # Additional features for mag, norm, velocity
-        additional_parts: list[pl.DataFrame] = []
-
-        if has_mag:
-            mag_add_exprs = _get_additional_feature_exprs("mag", include_mjd_features=False)
-            mag_add = df.select(["mag"]).lazy().select(mag_add_exprs).collect(engine=engine)
-            additional_parts.append(mag_add)
-
-        if has_norm and has_mjd:
-            norm_add_exprs = _get_additional_feature_exprs("norm", include_mjd_features=True)
-            norm_add = df.select(["norm", "mjd"]).lazy().select(norm_add_exprs).collect(engine=engine)
-            additional_parts.append(norm_add)
-
-        if has_velocity:
-            vel_add_exprs = _get_additional_feature_exprs("velocity", prefix="vel", include_mjd_features=False)
-            vel_add = df.select(["velocity"]).lazy().select(vel_add_exprs).collect(engine=engine)
-            additional_parts.append(vel_add)
-
-        additional_features = pl.concat(additional_parts, how="horizontal") if additional_parts else pl.DataFrame()
-        if float32 and len(additional_features) > 0:
-            additional_features = additional_features.cast({c: pl.Float32 for c in additional_features.columns if additional_features[c].dtype == pl.Float64})
-
-        # Argextremum stats (sub-series split by argmax/argmin)
-        argextremum_features = pl.DataFrame()
-        if argextremum_stats_col and argextremum_stats_col in df.columns:
-            stats_cols = [c for c in ["mag", "norm", "velocity"] if c in df.columns]
-            argext_exprs = _get_argextremum_stats_exprs(
-                index_col=argextremum_stats_col,
-                stats_cols=stats_cols,
-                compute_additional=argextremum_compute_additional_stats,
-                compute_argmin_stats=argextremum_compute_argmin_stats,
-                compute_argmax_stats=argextremum_compute_argmax_stats,
-            )
-            if argext_exprs:  # Only compute if there are expressions
-                df_for_argext = df.select([argextremum_stats_col] + [c for c in stats_cols if c != argextremum_stats_col])
-                argextremum_features = df_for_argext.lazy().select(argext_exprs).collect(engine=engine)
-                if float32 and len(argextremum_features) > 0:
-                    argextremum_features = argextremum_features.cast(
-                        {c: pl.Float32 for c in argextremum_features.columns if argextremum_features[c].dtype == pl.Float64}
-                    )
-
-        parts_to_combine = [main_features, additional_features]
-        if len(argextremum_features) > 0:
-            parts_to_combine.append(argextremum_features)
-        combined = pl.concat(parts_to_combine, how="horizontal")
-        fractions = compute_fraction_features(combined)
-        combined = pl.concat([combined, fractions], how="horizontal")
-
-        # Wavelet features (batch processing with pre-allocated array)
-        feature_names = _get_wavelet_feature_names(wavelets, max_level, prefix="norm")
-        n_features = len(feature_names)
-        all_wavelet_features = np.zeros((dataset_len, n_features), dtype=np.float64)
-
-        for i in tqdm(range(dataset_len), desc="wavelet features", unit="row"):
-            row = dataset[i]
-            mjd_arr = np.array(row["mjd"], dtype=np.float64)
-            mag_arr = np.array(row["mag"], dtype=np.float64)
-            magerr_arr = np.array(row["magerr"], dtype=np.float64)
-            norm = _safe_normalize(mag_arr, magerr_arr)
-            all_wavelet_features[i] = _compute_wavelet_features_array(norm, mjd_arr, wavelets, max_level, interpolate, n_interp_points)
-
-        wavelet_df = pl.DataFrame(all_wavelet_features, schema=feature_names)
-        if float32:
-            wavelet_df = wavelet_df.cast({c: pl.Float32 for c in wavelet_df.columns if wavelet_df[c].dtype == pl.Float64})
-
-        result = pl.concat([combined, wavelet_df], how="horizontal")
-        return result
+        return extract_features_from_polars(
+            df,
+            normalize=normalize,
+            float32=float32,
+            engine=engine,
+            wavelets=wavelets,
+            max_level=max_level,
+            interpolate=interpolate,
+            n_interp_points=n_interp_points,
+            argextremum_stats_col=argextremum_stats_col,
+            argextremum_compute_additional_stats=argextremum_compute_additional_stats,
+            argextremum_compute_argmin_stats=argextremum_compute_argmin_stats,
+            argextremum_compute_argmax_stats=argextremum_compute_argmax_stats,
+            od_col=od_col,
+            od_iqr=od_iqr,
+        )
 
     # =========================================================================
     # Large dataset: chunk processing with joblib
