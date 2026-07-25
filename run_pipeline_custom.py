@@ -76,15 +76,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=Path("./active_learning_output_custom"),
                    help="Директория результатов пайплайна")
     p.add_argument("--target-features", type=Path, default=Path("./data/all_features.parquet"),
-                   help="Parquet признаков target-сплита (для known flares)")
+                   help="Parquet признаков с размеченными вспышками (для transfer learning)")
+    p.add_argument("--target-label-source", choices=["surely_pos", "class_one"], default="class_one",
+                   help="Как брать known flares из --target-features: по индексам surely_pos "
+                        "(для target-сплита) или по class==1 (для train-сплита)")
+    p.add_argument("--max-target-flares", type=int, default=10000,
+                   help="Максимум known flares из --target-features (случайная подвыборка, 0 = все)")
     p.add_argument("--no-target-labels", action="store_true",
-                   help="Не использовать known flares с target (только своя разметка)")
+                   help="Не использовать known flares из --target-features (только своя разметка)")
     p.add_argument("--known-flare-indices", type=Path, default=None,
                    help="Текстовый файл: позиции (0-based) ваших известных вспышек")
     p.add_argument("--known-negative-indices", type=Path, default=None,
                    help="Текстовый файл: позиции надёжных НЕ-вспышек (forced negatives)")
     p.add_argument("--plot", action="store_true",
                    help="Строить графики кандидатов (требует память под сырые кривые)")
+    p.add_argument("--expert", action="store_true",
+                   help="Включить expert mode (интерактивная разметка через flare_labeller, нужен GUI)")
     p.add_argument("--max-iters", type=int, default=None,
                    help="Ограничение числа итераций AL (по умолчанию без лимита)")
     return p.parse_args()
@@ -140,21 +147,29 @@ def main() -> None:
         logger.info(f"Custom known flares: {len(custom_known)}")
 
     if not args.no_target_labels and args.target_features.exists():
-        from labels import surely_pos
-
-        logger.info(f"Loading target features for transfer learning from {args.target_features}")
+        logger.info(f"Loading labeled features for transfer learning from {args.target_features}")
         target_df = pl.read_parquet(args.target_features)
-        target_known = (
-            target_df.with_row_index("row_idx")
-            .filter(pl.col("row_idx").is_in(list(set(surely_pos))))
-            .drop("row_idx")
-            .with_columns(pl.lit(1).alias("class"))
-        )
+
+        if args.target_label_source == "surely_pos":
+            from labels import surely_pos
+
+            target_known = (
+                target_df.with_row_index("row_idx")
+                .filter(pl.col("row_idx").is_in(list(set(surely_pos))))
+                .drop("row_idx")
+            )
+        else:  # class_one
+            target_known = target_df.filter(pl.col("class") == 1)
+
+        if args.max_target_flares and len(target_known) > args.max_target_flares:
+            target_known = target_known.sample(n=args.max_target_flares, seed=42)
+
+        target_known = target_known.with_columns(pl.lit(1).alias("class"))
         # Оставляем только колонки, общие с нашими признаками
         common_cols = [c for c in features_df.columns if c in target_known.columns]
         target_known = target_known.select(common_cols)
         known_parts.append(target_known)
-        logger.info(f"Target known flares (transfer): {len(target_known)}")
+        logger.info(f"Transfer known flares ({args.target_label_source}): {len(target_known)}")
 
     if not known_parts:
         raise ValueError(
@@ -211,7 +226,7 @@ def main() -> None:
         config.data.n_validation_neg = min(5000, len(unlabeled) // 3)
         config.data.n_held_out_neg = 0
 
-    config.expert_mode = ExpertMode.EXPERT
+    config.expert_mode = ExpertMode.EXPERT if args.expert else ExpertMode.NO_EXPERT
     config.plot_samples = args.plot
     config.display_sample_plots = False
     config.max_iters = args.max_iters
@@ -242,6 +257,7 @@ def main() -> None:
     # Они невалидны для custom-данных, поэтому перенаправляем expert labels
     # в отдельный файл внутри output_dir (несуществующий => старые не подмешаются,
     # новые метки expert mode будут писаться туда).
+    args.output_dir.mkdir(parents=True, exist_ok=True)  # _save_expert_labels не создаёт родителя
     results = run_active_learning_pipeline(
         unlabeled_samples=unlabeled,
         known_flares=known_flares,
