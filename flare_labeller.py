@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
@@ -55,6 +56,27 @@ _ITER_PATTERN = re.compile(r"iter(\d+)")
 _PROBABILITY_PATTERN = re.compile(r"_P(\d+\.?\d*)pct_")
 _SOURCE_ID_PATTERN = re.compile(r"(?:added_|removed_)?([A-Z0-9]+_MJD[\d.]+)_row")
 _ROW_INDEX_PATTERN = re.compile(r"_row(\d+)_")
+
+# SNAD Viewer URL template (https://ztf.snad.space)
+SNAD_VIEWER_URL_TEMPLATE = "https://ztf.snad.space/view/{oid}"
+
+# OID extraction patterns from filenames:
+# - HF dataset ids: 'ZTFDR768214400043479_MJD58451.06854' -> '768214400043479'
+# - custom numeric ids: 'added_1637204300133721_row8_...' -> '1637204300133721'
+_ZTF_DR_OID_PATTERN = re.compile(r"ZTFDR(\d+)")
+_NUMERIC_OID_PATTERN = re.compile(r"(?:added_|removed_)(\d+)_row")
+
+
+def _extract_oid(filename: str) -> Optional[str]:
+    """Extract ZTF OID from a plot filename, for building the SNAD Viewer link."""
+    match = _ZTF_DR_OID_PATTERN.search(filename)
+    if match:
+        return match.group(1)
+    match = _NUMERIC_OID_PATTERN.search(filename)
+    if match:
+        return match.group(1)
+    return None
+
 
 # Search patterns for image discovery
 _SEARCH_PATTERNS = (
@@ -225,6 +247,7 @@ class FlareLabeller:
         self.seen_source_ids: set[str] = initial_seen_ids or set()  # Track all IDs we've seen
         self.labeled_indices: set[int] = set()  # Track which images have been labeled (for batch mode)
         self.finish_requested: bool = False  # Set when user clicks "Finish Labelling"
+        self.current_oid: Optional[str] = None  # OID of the currently displayed object
 
         # Find all images
         self._find_images()
@@ -246,6 +269,8 @@ class FlareLabeller:
         self.root.bind("x", lambda e: self._label_not_flare())
         self.root.bind("X", lambda e: self._label_not_flare())
         self.root.bind("<space>", lambda e: self._next_image())
+        self.root.bind("o", lambda e: self._open_snad_viewer())
+        self.root.bind("O", lambda e: self._open_snad_viewer())
 
         # Save window geometry on close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -331,6 +356,17 @@ class FlareLabeller:
         self.folder_label = ttk.Label(info_frame, text=self.folder.name, font=("Arial", 11, "bold"))
         self.folder_label.pack(side="left", padx=(20, 5))
         ttk.Button(info_frame, text="Open Folder...", command=self._open_new_folder).pack(side="left", padx=5)
+
+        # SNAD Viewer link (clickable)
+        self.snad_link = tk.Label(
+            info_frame,
+            text="SNAD Viewer (O)",
+            font=("Arial", 10, "underline"),
+            fg="#1a73e8",
+            cursor="hand2",
+        )
+        self.snad_link.pack(side="right", padx=(0, 10))
+        self.snad_link.bind("<Button-1>", lambda e: self._open_snad_viewer())
 
         # Filename entry (readonly but selectable/copyable)
         self.filename_var = tk.StringVar()
@@ -432,7 +468,7 @@ class FlareLabeller:
         self.stats_label.grid(row=2, column=0, columnspan=3, pady=(10, 0), sticky="w")
 
         # Keyboard shortcuts help
-        help_text = "Shortcuts: F/V=Flare, N/X=NotFlare, Space/→=Next, ←=Prev"
+        help_text = "Shortcuts: F/V=Flare, N/X=NotFlare, O=SNAD Viewer, Space/→=Next, ←=Prev"
         ttk.Label(main_frame, text=help_text, font=("Arial", 9), foreground="gray").grid(row=5, column=0, pady=(5, 0))
 
         # Finish Labelling button (only in batch mode)
@@ -469,6 +505,13 @@ class FlareLabeller:
             self.filename_var.set(str(rel_path))
         except ValueError:
             self.filename_var.set(filepath.name)
+
+        # Update SNAD Viewer link state based on whether OID was extracted
+        self.current_oid = _extract_oid(filepath.name)
+        if self.current_oid:
+            self.snad_link.config(fg="#1a73e8", cursor="hand2", text=f"SNAD Viewer: {self.current_oid} (O)")
+        else:
+            self.snad_link.config(fg="gray", cursor="arrow", text="SNAD Viewer: n/a")
 
         # Check for previous label and show warning
         row_idx = self._extract_row_index(filepath)
@@ -509,6 +552,14 @@ class FlareLabeller:
         except (FileNotFoundError, OSError, ValueError) as e:
             logger.warning(f"Error loading image {filepath}: {e}")
             self.image_label.config(text=f"Error loading image:\n{e}")
+
+    def _open_snad_viewer(self) -> None:
+        """Open the current object in the SNAD ZTF viewer (https://ztf.snad.space)."""
+        if not self.current_oid:
+            return
+        url = SNAD_VIEWER_URL_TEMPLATE.format(oid=self.current_oid)
+        logger.info(f"Opening SNAD Viewer: {url}")
+        webbrowser.open(url)
 
     def _next_image(self) -> None:
         """Go to next image."""
