@@ -62,9 +62,12 @@ SNAD_VIEWER_URL_TEMPLATE = "https://ztf.snad.space/view/{oid}"
 
 # OID extraction patterns from filenames:
 # - HF dataset ids: 'ZTFDR768214400043479_MJD58451.06854' -> '768214400043479'
-# - custom numeric ids: 'added_1637204300133721_row8_...' -> '1637204300133721'
+# - custom numeric ids with any action prefix:
+#   'candidate_1637207100060006_row46_...', 'added_1637204300133721_row8_...'
+#   -> long number (10+ digits) immediately before '_row<index>' is the OID
+#   (row index is short; ZTF OIDs are 15-16 digits)
 _ZTF_DR_OID_PATTERN = re.compile(r"ZTFDR(\d+)")
-_NUMERIC_OID_PATTERN = re.compile(r"(?:added_|removed_)(\d+)_row")
+_NUMERIC_OID_PATTERN = re.compile(r"(\d{10,})_row\d")
 
 
 def _extract_oid(filename: str) -> Optional[str]:
