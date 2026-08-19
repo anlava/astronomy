@@ -55,6 +55,11 @@ HUNT_CLUSTER_COLS = {
     "pmDE": "cluster_pmde",
     "Plx": "cluster_plx",
     "RV": "cluster_rv_kms",
+    "logAge16": "cluster_log_age16",
+    "logAge50": "cluster_log_age50",
+    "logAge84": "cluster_log_age84",
+    "AV50": "cluster_av50_mag",
+    "MOD50": "cluster_mod50_mag",
 }
 GAIA_COLS = {
     "Source": "gaia_source_id",
@@ -206,7 +211,7 @@ def main() -> None:
     oids = pd.read_csv(args.input)["oid"].astype("int64").tolist()
     logger.info(f"Loaded {len(oids)} oids from {args.input}")
 
-    vizier = Vizier(columns=["all"])  # all columns, we filter later
+    vizier = Vizier(columns=["**"])  # all columns of all tables (incl. ages; ["all"] misses them)
     vizier.ROW_LIMIT = 50
 
     session = requests.Session()
